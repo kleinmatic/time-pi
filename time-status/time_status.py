@@ -44,7 +44,8 @@ GNSS_IDS = range(8)
 # linuxptp servo lines, e.g. "/dev/ptp0 offset -3 s2 freq +1234" or "CLOCK_REALTIME phc offset 5 s2 freq -12 delay 456".
 OFFSET_RE = re.compile(r"offset\s+(-?\d{1,12})\s+s([0-2])\s+freq\s+([+-]?\d{1,12})")
 SERVO_SRC = {"ts2phc": "phc", "phc2sys": "sys"}
-HOSTNAME_RE = re.compile(r"[A-Za-z0-9.-]{1,64}")
+HOSTNAME_RE = re.compile(r"[A-Za-z0-9.-]{1,100}")
+RDNS_RETRY = 3600   # seconds before asking again for an address that had no name
 
 lock = threading.Lock()
 live = {"gnss": {}, "sats": [], "servo": {}, "chrony": None, "peers": [], "adev": {}}
@@ -194,18 +195,47 @@ def poll_chrony():
     return tracking, peers, freq_ppm
 
 
+rdns_cache = {}  # address -> (name or None, time asked)
+
+
+def rdns_lookup(addr):
+    try:
+        name = socket.gethostbyaddr(addr)[0].rstrip(".")
+    except OSError:
+        name = None
+    rdns_cache[addr] = (name if name and name != addr and HOSTNAME_RE.fullmatch(name) else None, time.time())
+
+
+def rdns(addr):
+    """Reverse DNS name of a pool member, or its address until the lookup answers or when it has none.
+
+    The lookup runs on its own thread, so a slow resolver never holds up the poller.
+    """
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        return addr  # a refclock (PPS, NMEA)
+    hit = rdns_cache.get(addr)
+    if hit is None or (hit[0] is None and time.time() - hit[1] > RDNS_RETRY):
+        rdns_cache[addr] = (None, time.time())
+        threading.Thread(target=rdns_lookup, args=(addr,), daemon=True).start()
+    return rdns_cache[addr][0] or addr
+
+
 def source_labels(rows):
-    """Configured hostnames for servers set up by name; IP addresses for everything else.
+    """Configured hostnames for servers set up by name; reverse DNS names for pool members.
 
     `chronyc -N` prints names as written in chrony.conf. Pool members all print the pool's
-    name, so a name that repeats (or a mismatched listing) falls back to the IP address.
+    name, so a name that repeats (or a mismatched listing) falls back to reverse DNS, and
+    to the address when that has no name or two members share one.
     """
     ips = [r[2][:64] for r in rows]
     named = [r[2][:64] for r in chronyc("-N", "sources")[:32] if len(r) >= 10]
     if len(named) != len(ips):
-        return ips
-    return [n if named.count(n) == 1 and n != ip and HOSTNAME_RE.fullmatch(n) else ip
-            for n, ip in zip(named, ips)]
+        named = ips
+    labels = [n if named.count(n) == 1 and n != ip and HOSTNAME_RE.fullmatch(n) else rdns(ip)
+              for n, ip in zip(named, ips)]
+    return [label if labels.count(label) == 1 else ip for label, ip in zip(labels, ips)]
 
 
 def read_temp():
@@ -385,7 +415,7 @@ def poller():
             tracking, peers, freq_ppm = poll_chrony()
             now = time.time()
             (record_refclock if REFCLOCK else record_phc_refclock)(peers, freq_ppm, now)
-            new = [(int(now - p["lastrx"]), p["name"], p["offset"]) for p in peers
+            new = [(int(now - p["lastrx"]), p["addr"], p["offset"]) for p in peers  # keyed by address: labels can change
                    if p["mode"] == "^" and p["lastrx"] < POLL and p["reach"] != "0" and p["offset"] is not None]
             if new:
                 db_exec("INSERT INTO peers VALUES (?,?,?)", new, many=True)
@@ -506,10 +536,11 @@ def api_history(span):
             out["servo"][src] = [[b, s / n * 1e-9, lo * 1e-9, hi * 1e-9] for b, n, s, lo, hi in rows]
     with lock:
         peers = [p for p in live["peers"] if p["mode"] == "^"]
-    for name, shown in display_names(peers).items():
+    names = display_names(peers)
+    for p in peers:
         rows = db_exec("SELECT ts/?*? AS b, AVG(offset) FROM peers WHERE name=? AND ts>=? GROUP BY b ORDER BY b",
-                       (step, step, name, since))
-        out["peers"][shown] = [list(r) for r in rows]
+                       (step, step, p["addr"], since))
+        out["peers"][names[p["name"]]] = [list(r) for r in rows]
     return out
 
 
