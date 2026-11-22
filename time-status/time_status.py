@@ -415,7 +415,7 @@ def poller():
             tracking, peers, freq_ppm = poll_chrony()
             now = time.time()
             (record_refclock if REFCLOCK else record_phc_refclock)(peers, freq_ppm, now)
-            new = [(int(now - p["lastrx"]), p["addr"], p["offset"]) for p in peers  # keyed by address: labels can change
+            new = [(int(now - p["lastrx"]), p["addr"], p["offset"]) for p in peers  # by address: labels change
                    if p["mode"] == "^" and p["lastrx"] < POLL and p["reach"] != "0" and p["offset"] is not None]
             if new:
                 db_exec("INSERT INTO peers VALUES (?,?,?)", new, many=True)
